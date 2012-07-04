@@ -347,59 +347,39 @@ class AsyncConnection(Connection):
         Connection.__init__(self, *args, **kwargs)
         self._queue = Queue.Queue()
 
-        def _async_read_result(fd, ev):
-            res = []
-            callback, on_error = self._queue.get()
-            try:
-                self.read_query_result()
-                # Collect results
-                result = self.use_result()
-                while True:
-                    row = result.fetch_row()
-                    if not row:
-                        break
-                    res.append(row[0])
-                # Fire callback with results
-                callback(res)
-            except Exception, e:
-                if on_error:
-                    return on_error(e)
-                else:
-                    raise e
-        ioloop.IOLoop.instance().add_handler(self.fd,
-            _async_read_result, ioloop.IOLoop.READ)
-
     def async_query(self, query, callback, on_error=None, args=None):
         """ Non-blocking query. callback is function that takes list
             of tuple args """
-        self.send_query(query)
-        self._queue.put((callback, on_error))
+        self._queue.put((query, callback, on_error))
 
+        def _async_send_query(fd, ev):
+            query, callback, on_error = self._queue.get()
+            self.send_query(query)
 
-    def cb_factory(self, callback, on_error=None):
-        """ Returns a function that handles the ioloop call back """
-        def cb(fd, ev):
-            res = []
-            try:
-                self.read_query_result()
-                # Collect results
-                result = self.use_result()
-                while True:
-                    row = result.fetch_row()
-                    if not row:
-                        break
-                    res.append(row[0])
-                # Fire callback with results
-                callback(res)
-            except Exception, e:
-                if on_error:
-                    return on_error(e)
-                else:
-                    raise e
-            finally:
-                self.async_cleanup()
-        return cb
-
-    def async_cleanup(self):
-        ioloop.IOLoop.instance().remove_handler(self.fd)
-        self.close()
+            def _async_read_result(fd, ev):
+                res = []
+                try:
+                    self.read_query_result()
+                    # Collect results
+                    result = self.use_result()
+                    while True:
+                        row = result.fetch_row()
+                        if not row:
+                            break
+                        res.append(row[0])
+                    # Fire callback with results
+                    callback(res)
+                except Exception, e:
+                    if on_error:
+                        return on_error(e)
+                    else:
+                        raise e
+                finally:
+                    if self._queue.empty():
+                        ioloop.IOLoop.instance().remove_handler(self.fd)
+                    else:
+                        ioloop.IOLoop.instance().update_handler(self.fd, ioloop.IOLoop.WRITE)
+                        ioloop.IOLoop.instance().add_handler(self.fd, _async_send_query, ioloop.IOLoop.WRITE)
+            ioloop.IOLoop.instance().update_handler(self.fd, ioloop.IOLoop.READ)
+            ioloop.IOLoop.instance().add_handler(self.fd, _async_read_result, ioloop.IOLoop.READ)
+        ioloop.IOLoop.instance().add_handler(self.fd, _async_send_query, ioloop.IOLoop.WRITE)
